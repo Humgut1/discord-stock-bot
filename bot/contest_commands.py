@@ -344,6 +344,13 @@ def setup(bot: commands.Bot):
 
         currency  = price_data.get("currency", "KRW")
         is_usd    = currency == "USD"
+
+        # 장 시간 체크
+        open_ok, open_msg = toss_api.is_market_open(currency)
+        if not open_ok:
+            await interaction.followup.send(f"❌ {open_msg}", ephemeral=True)
+            return
+
         unit      = "$" if is_usd else "원"
         name      = stock_info.get("name", 종목)
 
@@ -428,6 +435,13 @@ def setup(bot: commands.Bot):
 
         currency  = price_data.get("currency", "KRW")
         is_usd    = currency == "USD"
+
+        # 장 시간 체크
+        open_ok, open_msg = toss_api.is_market_open(currency)
+        if not open_ok:
+            await interaction.followup.send(f"❌ {open_msg}", ephemeral=True)
+            return
+
         unit      = "$" if is_usd else "원"
         name      = stock_info.get("name", 종목)
         rate      = toss_api.get_exchange_rate() if is_usd else 1.0

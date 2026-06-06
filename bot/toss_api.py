@@ -124,6 +124,59 @@ def usd_to_krw(usd: float) -> float:
     return usd * get_exchange_rate()
 
 
+def is_market_open(currency: str) -> tuple[bool, str]:
+    """
+    현재 해당 시장이 거래 가능한지 확인.
+    returns: (거래가능여부, 사유 메시지)
+    """
+    market = "US" if currency == "USD" else "KR"
+    try:
+        resp = httpx.get(
+            f"{BASE}/api/v1/market-calendar/{market}",
+            headers=_headers(),
+        )
+        resp.raise_for_status()
+        today = resp.json()["result"]["today"]
+
+        if market == "KR":
+            integrated = today.get("integrated")
+            if not integrated:
+                return False, "오늘은 국내 시장 휴장일이에요."
+            pre    = integrated.get("preMarket")
+            reg    = integrated.get("regularMarket")
+            after  = integrated.get("afterMarket")
+            sessions = [s for s in [pre, reg, after] if s]
+        else:
+            sessions = [
+                today.get("preMarket"),
+                today.get("regularMarket"),
+                today.get("afterMarket"),
+                today.get("dayMarket"),
+            ]
+            sessions = [s for s in sessions if s]
+
+        if not sessions:
+            return False, "오늘은 휴장일이에요."
+
+        from datetime import datetime, timezone
+        import dateutil.parser
+
+        now = datetime.now(timezone.utc)
+        for s in sessions:
+            start = dateutil.parser.parse(s["startTime"])
+            end   = dateutil.parser.parse(s["endTime"])
+            if start <= now <= end:
+                return True, ""
+
+        # 장 시간 정보 안내
+        next_open = sessions[0]["startTime"][:16].replace("T", " ")
+        return False, f"현재 장 시간이 아니에요.\n다음 거래 시작: `{next_open}`"
+
+    except Exception:
+        # API 오류 시 거래 허용 (안전하게 통과)
+        return True, ""
+
+
 def get_candles(symbol: str, interval: str = "1d", count: int = 30) -> list:
     """캔들 데이터. interval: 1m / 1d"""
     resp = httpx.get(
