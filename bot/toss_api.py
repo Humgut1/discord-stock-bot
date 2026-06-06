@@ -5,6 +5,10 @@ import os
 _token: str | None = None
 _token_expires: float = 0
 
+# 환율 캐시 (1분 유효)
+_exchange_rate: float | None = None
+_exchange_rate_expires: float = 0
+
 BASE = "https://openapi.tossinvest.com"
 
 # 종목명 → 종목코드 매핑 (검색 API 없음)
@@ -95,6 +99,29 @@ def get_stock_info(symbol: str) -> dict:
     resp.raise_for_status()
     items = resp.json().get("result", [])
     return items[0] if items else {}
+
+
+def get_exchange_rate() -> float:
+    """USD → KRW 환율 조회 (1분 캐시)"""
+    global _exchange_rate, _exchange_rate_expires
+    if _exchange_rate and time.time() < _exchange_rate_expires:
+        return _exchange_rate
+
+    resp = httpx.get(
+        f"{BASE}/api/v1/exchange-rate",
+        params={"baseCurrency": "USD", "quoteCurrency": "KRW"},
+        headers=_headers(),
+    )
+    resp.raise_for_status()
+    rate = float(resp.json()["result"]["rate"])
+    _exchange_rate = rate
+    _exchange_rate_expires = time.time() + 60
+    return rate
+
+
+def usd_to_krw(usd: float) -> float:
+    """달러 → 원화 환산"""
+    return usd * get_exchange_rate()
 
 
 def get_candles(symbol: str, interval: str = "1d", count: int = 30) -> list:

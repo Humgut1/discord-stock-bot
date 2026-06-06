@@ -56,10 +56,17 @@ def _check_market(symbol: str, market: str, stock_info: dict) -> bool:
     return False
 
 
+def _cur_to_krw(price: float, currency: str) -> float:
+    """가격을 원화로 환산 (USD면 환율 적용)"""
+    if currency == "USD":
+        return price * toss_api.get_exchange_rate()
+    return price
+
+
 async def _calc_scores(contest_id: int) -> list[tuple]:
-    """(username, discord_id, total_eval, pnl, pct) 리스트, 수익률 내림차순"""
-    contest    = cdb.get_contest(contest_id)
-    init_cash  = contest["init_cash"]
+    """(username, discord_id, total_eval_krw, pnl, pct) 리스트, 수익률 내림차순"""
+    contest      = cdb.get_contest(contest_id)
+    init_cash    = contest["init_cash"]
     participants = cdb.get_all_participants(contest_id)
 
     scores = []
@@ -68,8 +75,13 @@ async def _calc_scores(contest_id: int) -> list[tuple]:
         eval_total = p["cash"]
         for h in holdings:
             price_data = toss_api.get_price(h["symbol"])
-            cur = float(price_data.get("lastPrice", h["avg_price"])) if price_data else h["avg_price"]
-            eval_total += cur * h["qty"]
+            if price_data:
+                cur_raw  = float(price_data.get("lastPrice", h["avg_price"]))
+                currency = price_data.get("currency", "KRW")
+                cur_krw  = _cur_to_krw(cur_raw, currency)
+            else:
+                cur_krw = h["avg_price"]   # avg_price는 이미 원화로 저장
+            eval_total += cur_krw * h["qty"]
         pnl = eval_total - init_cash
         pct = pnl / init_cash * 100
         scores.append((p["username"], p["discord_id"], eval_total, pnl, pct))
@@ -330,38 +342,51 @@ def setup(bot: commands.Bot):
             )
             return
 
-        name  = stock_info.get("name", 종목)
-        total = 가격 * 수량
-        unit  = "$" if price_data.get("currency") == "USD" else "원"
+        currency  = price_data.get("currency", "KRW")
+        is_usd    = currency == "USD"
+        unit      = "$" if is_usd else "원"
+        name      = stock_info.get("name", 종목)
 
-        if total > participant["cash"]:
+        # 주문가 원화 환산
+        rate      = toss_api.get_exchange_rate() if is_usd else 1.0
+        가격_krw  = 가격 * rate
+        total_krw = 가격_krw * 수량
+
+        if total_krw > participant["cash"]:
+            rate_str = f" (환율 {fmt(rate)}원/달러)" if is_usd else ""
             await interaction.followup.send(
-                f"❌ 잔고 부족\n필요: **{fmt(total)}원** / 보유: **{fmt(participant['cash'])}원**",
+                f"❌ 잔고 부족\n"
+                f"필요: **{fmt(total_krw)}원** ({fmt(가격)}{unit} × {수량}주{rate_str})\n"
+                f"보유: **{fmt(participant['cash'])}원**",
                 ephemeral=True,
             )
             return
 
-        cdb.update_cash(대회id, str(interaction.user.id), -total)
+        # 주문은 원화 기준 avg_price 로 저장 (잔고 계산 일원화)
+        cdb.update_cash(대회id, str(interaction.user.id), -total_krw)
         order_id = cdb.create_order(
             대회id, str(interaction.user.id), interaction.user.display_name,
-            symbol, name, "buy", 수량, 가격,
+            symbol, name, "buy", 수량, 가격_krw,   # DB엔 원화 가격 저장
         )
 
-        cur = float(price_data.get("lastPrice", 0))
-        imm = cur <= 가격
+        cur_raw  = float(price_data.get("lastPrice", 0))
+        cur_krw  = cur_raw * rate
+        imm      = cur_raw <= 가격   # 비교는 원래 통화로
         if imm:
             cdb.fill_order(order_id)
-            cdb.upsert_holding(대회id, str(interaction.user.id), symbol, name, 수량, 가격)
+            cdb.upsert_holding(대회id, str(interaction.user.id), symbol, name, 수량, 가격_krw)
 
+        rate_info = f" (환율 {fmt(rate)}원/$)" if is_usd else ""
         embed = discord.Embed(
             title="✅ 즉시 체결!" if imm else "⏳ 매수 주문 접수",
             color=discord.Color.green(),
         )
-        embed.add_field(name="종목",   value=name, inline=True)
-        embed.add_field(name="수량",   value=f"{수량}주", inline=True)
-        embed.add_field(name="주문가", value=f"{fmt(가격)}{unit}", inline=True)
-        embed.add_field(name="현재가", value=f"{fmt(cur)}{unit}", inline=True)
-        embed.set_footer(text=f"주문번호 #{order_id} · 잔여 {fmt(participant['cash'] - total)}원")
+        embed.add_field(name="종목",       value=name, inline=True)
+        embed.add_field(name="수량",       value=f"{수량}주", inline=True)
+        embed.add_field(name="주문가",     value=f"{fmt(가격)}{unit}", inline=True)
+        embed.add_field(name="현재가",     value=f"{fmt(cur_raw)}{unit}", inline=True)
+        embed.add_field(name="원화 환산",  value=f"≈ {fmt(total_krw)}원{rate_info}", inline=True)
+        embed.set_footer(text=f"주문번호 #{order_id} · 잔여 {fmt(participant['cash'] - total_krw)}원")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
         # 체결 알림 채널 공개
@@ -401,10 +426,14 @@ def setup(bot: commands.Bot):
             await interaction.followup.send(f"❌ **{종목}** 종목을 찾을 수 없어요.", ephemeral=True)
             return
 
-        name     = stock_info.get("name", 종목)
+        currency  = price_data.get("currency", "KRW")
+        is_usd    = currency == "USD"
+        unit      = "$" if is_usd else "원"
+        name      = stock_info.get("name", 종목)
+        rate      = toss_api.get_exchange_rate() if is_usd else 1.0
+
         holdings = {h["symbol"]: h for h in cdb.get_holdings(대회id, str(interaction.user.id))}
         holding  = holdings.get(symbol)
-        unit     = "$" if price_data.get("currency") == "USD" else "원"
 
         if not holding or holding["qty"] < 수량:
             have = holding["qty"] if holding else 0
@@ -413,33 +442,42 @@ def setup(bot: commands.Bot):
             )
             return
 
+        가격_krw  = 가격 * rate
+        total_krw = 가격_krw * 수량
+
         cdb.reduce_holding(대회id, str(interaction.user.id), symbol, 수량)
         order_id = cdb.create_order(
             대회id, str(interaction.user.id), interaction.user.display_name,
-            symbol, name, "sell", 수량, 가격,
+            symbol, name, "sell", 수량, 가격_krw,  # DB엔 원화 가격 저장
         )
 
-        cur = float(price_data.get("lastPrice", 0))
-        imm = cur >= 가격
+        cur_raw = float(price_data.get("lastPrice", 0))
+        imm     = cur_raw >= 가격
         if imm:
             cdb.fill_order(order_id)
-            cdb.update_cash(대회id, str(interaction.user.id), 가격 * 수량)
+            cdb.update_cash(대회id, str(interaction.user.id), total_krw)
+
+        # 손익 계산 (avg_price는 원화로 저장돼 있음)
+        pnl_krw = (가격_krw - holding["avg_price"]) * 수량
 
         embed = discord.Embed(
             title="✅ 즉시 체결!" if imm else "⏳ 매도 주문 접수",
             color=discord.Color.red(),
         )
-        embed.add_field(name="종목",   value=name, inline=True)
-        embed.add_field(name="수량",   value=f"{수량}주", inline=True)
-        embed.add_field(name="주문가", value=f"{fmt(가격)}{unit}", inline=True)
-        embed.add_field(name="현재가", value=f"{fmt(cur)}{unit}", inline=True)
+        embed.add_field(name="종목",      value=name, inline=True)
+        embed.add_field(name="수량",      value=f"{수량}주", inline=True)
+        embed.add_field(name="주문가",    value=f"{fmt(가격)}{unit}", inline=True)
+        embed.add_field(name="현재가",    value=f"{fmt(cur_raw)}{unit}", inline=True)
+        embed.add_field(name="원화 환산", value=f"≈ {fmt(total_krw)}원", inline=True)
+        if imm:
+            sign = "+" if pnl_krw >= 0 else ""
+            embed.add_field(name="실현 손익", value=f"{sign}{fmt(pnl_krw)}원", inline=True)
         embed.set_footer(text=f"주문번호 #{order_id}")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
         fill_ch = interaction.guild.get_channel(int(contest["fill_channel_id"])) if contest["fill_channel_id"] else None
         if fill_ch and imm:
-            pnl = (가격 - holding["avg_price"]) * 수량
-            sign = "+" if pnl >= 0 else ""
+            sign = "+" if pnl_krw >= 0 else ""
             await fill_ch.send(
                 f"🔴 **{interaction.user.display_name}**님 · **{name}** {수량}주 매도 체결 @ {fmt(가격)}{unit} "
                 f"({sign}{fmt(pnl)}원)"
@@ -467,14 +505,23 @@ def setup(bot: commands.Bot):
 
         for h in holdings:
             price_data = toss_api.get_price(h["symbol"])
-            cur  = float(price_data.get("lastPrice", h["avg_price"])) if price_data else h["avg_price"]
-            pnl  = (cur - h["avg_price"]) * h["qty"]
-            pct  = (cur - h["avg_price"]) / h["avg_price"] * 100
-            eval_total += cur * h["qty"]
+            if price_data:
+                cur_raw  = float(price_data.get("lastPrice", h["avg_price"]))
+                currency = price_data.get("currency", "KRW")
+                cur_krw  = _cur_to_krw(cur_raw, currency)
+                unit     = "$" if currency == "USD" else "원"
+            else:
+                cur_krw = h["avg_price"]
+                cur_raw = h["avg_price"]
+                unit    = "원"
+            # avg_price는 원화로 저장돼 있으므로 바로 비교
+            pnl = (cur_krw - h["avg_price"]) * h["qty"]
+            pct = (cur_krw - h["avg_price"]) / h["avg_price"] * 100 if h["avg_price"] else 0
+            eval_total += cur_krw * h["qty"]
             sign = "▲" if pnl >= 0 else "▼"
             embed.add_field(
                 name=f"{h['name']} ({h['qty']}주)",
-                value=f"평균 {fmt(h['avg_price'])}원\n{sign} {fmt(abs(pnl))}원 ({pct:+.2f}%)",
+                value=f"현재 {fmt(cur_raw)}{unit} · 평균 {fmt(h['avg_price'])}원\n{sign} {fmt(abs(pnl))}원 ({pct:+.2f}%)",
                 inline=True,
             )
 
